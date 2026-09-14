@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Real-Time Log Monitoring — an app writes JSON-lines logs to S3; each new
+  file triggers a Lambda that parses records, emails one consolidated alert
+  per file containing ERRORs, and emits CloudWatch metrics with an alarm.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: >-
+      Email address subscribed to error alerts. AWS sends a confirmation
+      email — the subscription stays "PendingConfirmation" until clicked.
+  ErrorThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: >-
+      Errors within a 5-minute window that trip the CloudWatch alarm.
+  LogSuffix:
+    Type: String
+    Default: .jsonl
+    AllowedValues:
+      - .jsonl
+      - .log
+    Description: >-
+      File suffix that triggers the LogProcessor function. Defaults to
+      .jsonl because the handler parses JSON-lines; plain .log text would
+      mostly land in the malformed counter.
+  MetricNamespace:
+    Type: String
+    Default: LogMonitoring
+    Description: CloudWatch namespace for the pipeline metrics.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+
+Resources:
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-log-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  LogProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Description: Parses JSON-lines logs from S3, alerts on ERRORs via SNS, emits CloudWatch metrics.
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          ERROR_SUMMARY_LIMIT: "5"
+          EXPECTED_SUFFIX: !Ref LogSuffix
+      Events:
+        LogUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref LogsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: !Ref LogSuffix
+      Policies:
+        - Statement:
+            - Sid: ReadLogObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${LogsBucket.Arn}/*"
+            - Sid: PublishAlerts
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref AlertsTopic
+            - Sid: EmitPipelineMetrics
+              Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: !Ref MetricNamespace
+            - Sid: WriteOwnLogs
+              Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+            # Note: SAM also attaches the AWSLambdaBasicExecutionRole managed
+            # policy, which covers the same log-group actions.
+
+  ErrorSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-error-spike"
+      AlarmDescription: >-
+        Fires when the undimensioned ErrorsSeen metric reaches the threshold
+        within 5 minutes. The handler publishes one undimensioned ErrorsSeen
+        datapoint per processed file exactly so this alarm can aggregate
+        across files and services.
+      Namespace: !Ref MetricNamespace
+      MetricName: ErrorsSeen
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  LogsBucketName:
+    Description: Upload .jsonl log files here to trigger processing.
+    Value: !Ref LogsBucket
+  AlertsTopicArn:
+    Description: SNS topic receiving per-file error alerts and alarm notifications.
+    Value: !Ref AlertsTopic
+  MetricNamespace:
+    Description: CloudWatch namespace for ErrorsSeen / RecordsProcessed / MalformedLines.
+    Value: !Ref MetricNamespace
+  ErrorSpikeAlarmName:
+    Description: CloudWatch alarm watching the aggregate error metric.
+    Value: !Ref ErrorSpikeAlarm
