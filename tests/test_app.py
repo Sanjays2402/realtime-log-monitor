@@ -79,8 +79,14 @@ def _metric(metric_name):
     return [m for m in kwargs["MetricData"] if m["MetricName"] == metric_name]
 
 
-def _rec(severity, msg="boom", service="payments", ts="2026-09-13T02:11:04Z"):
-    return {"ts": ts, "service": service, "severity": severity, "message": msg}
+def _rec(severity, msg="boom", service="payments", ts="2026-09-13T02:11:04Z",
+        status_code=None, latency_ms=None):
+    rec = {"ts": ts, "service": service, "severity": severity, "message": msg}
+    if status_code is not None:
+        rec["status_code"] = status_code
+    if latency_ms is not None:
+        rec["latency_ms"] = latency_ms
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +233,24 @@ def test_template_yaml_smoke_check():
         template = yaml.safe_load(fh)
 
     resources = template["Resources"]
-    for name in ("LogsBucket", "LogProcessor", "AlertsTopic", "ErrorSpikeAlarm"):
+    for name in ("LogsBucket", "LogProcessor", "AlertsTopic", "ErrorSpikeAlarm",
+                 "LogMonitoringDashboard"):
         assert name in resources, f"missing resource {name}"
 
     fn_props = resources["LogProcessor"]["Properties"]
     assert fn_props["Handler"] == "app.lambda_handler"
     env = fn_props["Environment"]["Variables"]
     assert "SNS_TOPIC_ARN" in env and "METRIC_NAMESPACE" in env
+    # Detector thresholds are configurable via environment variables.
+    assert env["FIVEXX_THRESHOLD"] == "5"
+    assert env["ERROR_RATE_THRESHOLD"] == "0.10"
+    assert env["LATENCY_P99_THRESHOLD_MS"] == "2000"
+
+    # The dashboard graphs the pipeline's metrics.
+    dashboard_body = json.dumps(
+        resources["LogMonitoringDashboard"]["Properties"]["DashboardBody"])
+    for metric in ("ErrorsSeen", "ServerErrors5xx", "ErrorRate", "LatencyP99"):
+        assert metric in dashboard_body, f"dashboard missing {metric}"
 
     policies = fn_props["Policies"][0]["Statement"]
     actions = {a for stmt in policies for a in stmt["Action"]}
@@ -248,3 +265,145 @@ def test_template_yaml_smoke_check():
     assert alarm["MetricName"] == "ErrorsSeen"
     assert alarm["Period"] == 300
     assert len(alarm["AlarmActions"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# New detectors: 5xx spike, error-rate threshold, latency p99 threshold
+# ---------------------------------------------------------------------------
+def test_fivexx_spike_detector_fires_alert_without_error_severity():
+    # 6 responses with 5xx status, all marked INFO — the 5xx detector
+    # (default threshold 5) must still raise an alert.
+    _s3_object([_rec("INFO", f"req {i}", status_code=503)
+                for i in range(6)])
+
+    result = app._process_object("logs-bucket", "app/2026-09-13.jsonl")
+
+    assert result["fivexx"] == 6
+    assert [f["detector"] for f in result["findings"]] == ["5xx_spike"]
+
+    assert sns_mock.publish.call_count == 1
+    _, kwargs = sns_mock.publish.call_args
+    assert "[5xx_spike]" in kwargs["Subject"]
+    assert "5xx_spike" in kwargs["Message"]
+    assert "6 responses with 5xx status" in kwargs["Message"]
+
+    fivexx = [m for m in _metric("ServerErrors5xx") if m.get("Dimensions")]
+    assert fivexx[0]["Value"] == 6
+    assert any(not m.get("Dimensions") and m["Value"] == 6
+               for m in _metric("ServerErrors5xx"))
+
+
+def test_fivexx_detector_stays_quiet_below_threshold():
+    _s3_object([_rec("INFO", f"req {i}", status_code=503) for i in range(4)]
+               + [_rec("INFO", "ok", status_code=200)])
+
+    result = app._process_object("logs-bucket", "app/2026-09-13.jsonl")
+
+    assert result["fivexx"] == 4
+    assert result["findings"] == []
+    sns_mock.publish.assert_not_called()
+
+
+def test_error_rate_detector_fires_on_high_error_fraction():
+    lines = ([_rec("ERROR", f"bad {i}") for i in range(3)]
+             + [_rec("INFO", f"ok {i}") for i in range(17)])
+    _s3_object(lines)
+
+    result = app._process_object("logs-bucket", "app/2026-09-13.jsonl")
+
+    assert result["error_rate"] == pytest.approx(0.15)
+    assert "error_rate" in [f["detector"] for f in result["findings"]]
+
+    _, kwargs = sns_mock.publish.call_args
+    assert "[error_rate]" in kwargs["Subject"]
+    assert "error rate 15.0%" in kwargs["Message"]
+
+    rate = [m for m in _metric("ErrorRate") if m.get("Dimensions")]
+    assert rate[0]["Value"] == pytest.approx(0.15)
+
+
+def test_error_rate_detector_stays_quiet_below_threshold():
+    lines = [_rec("ERROR", "one bad")] + [_rec("INFO", f"ok {i}")
+                                          for i in range(19)]
+    _s3_object(lines)
+
+    result = app._process_object("logs-bucket", "app/2026-09-13.jsonl")
+
+    assert result["findings"] == []
+
+
+def test_latency_p99_detector_fires_and_emits_metric():
+    lines = ([_rec("INFO", f"ok {i}", latency_ms=100) for i in range(9)]
+             + [_rec("ERROR", "slow", latency_ms=5000)])
+    _s3_object(lines)
+
+    result = app._process_object("logs-bucket", "app/2026-09-13.jsonl")
+
+    assert result["latency_p99"] == 5000
+    assert "latency_p99" in [f["detector"] for f in result["findings"]]
+
+    _, kwargs = sns_mock.publish.call_args
+    assert "[latency_p99]" in kwargs["Subject"]
+    assert "p99 latency 5,000 ms" in kwargs["Message"]
+
+    p99 = [m for m in _metric("LatencyP99") if m.get("Dimensions")]
+    assert p99[0]["Value"] == 5000
+    assert p99[0]["Unit"] == "Milliseconds"
+    assert any(not m.get("Dimensions") for m in _metric("LatencyP99"))
+
+
+def test_no_latency_samples_means_no_latency_metric():
+    _s3_object([_rec("INFO", "ok"), _rec("INFO", "fine")])
+
+    app.lambda_handler(_event(), None)
+
+    assert cw_mock.put_metric_data.called
+    _, kwargs = cw_mock.put_metric_data.call_args
+    names = {m["MetricName"] for m in kwargs["MetricData"]}
+    assert "LatencyP99" not in names
+
+
+def test_detector_thresholds_read_from_env_with_bad_value_fallback():
+    import importlib
+    import os as _os
+
+    old = dict(_os.environ)
+    try:
+        _os.environ["FIVEXX_THRESHOLD"] = "not-a-number"
+        _os.environ["ERROR_RATE_THRESHOLD"] = "12"
+        _os.environ["LATENCY_P99_THRESHOLD_MS"] = ""
+        importlib.reload(app)
+        assert app.FIVEXX_THRESHOLD == 5  # bad value -> default
+        assert app.ERROR_RATE_THRESHOLD == 12.0  # valid value honored
+        assert app.LATENCY_P99_THRESHOLD_MS == 2000.0  # empty -> default
+    finally:
+        _os.environ.clear()
+        _os.environ.update(old)
+        importlib.reload(app)
+
+
+def test_generate_sample_logs_produces_valid_demo_file(tmp_path):
+    import subprocess
+
+    script = (Path(__file__).resolve().parent.parent
+              / "scripts" / "generate_sample_logs.py")
+    out = tmp_path / "demo.jsonl"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--records", "100", "--burst-size", "20",
+         "--seed", "1", "--output", str(out)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(rows) == 100
+    for row in rows:
+        assert {"ts", "service", "severity", "status_code", "latency_ms",
+                "message", "request_id"} <= set(row)
+
+    errors = sum(1 for r in rows if r["severity"] == "ERROR")
+    fivexx = sum(1 for r in rows if 500 <= r["status_code"] < 600)
+    # The injected burst (20 records, mostly errors) must be visible.
+    assert errors >= 10
+    assert fivexx >= 10
+    # Timestamps are monotonic and ISO-8601.
+    assert [r["ts"] for r in rows] == sorted(r["ts"] for r in rows)

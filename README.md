@@ -1,9 +1,11 @@
 # Real-Time Log Monitoring on AWS
 
 An event-driven pipeline: an app writes JSON-lines logs to S3, each new file
-triggers a Lambda that parses the records, emails **one consolidated alert**
-per file containing `ERROR`s, and emits CloudWatch metrics with an alarm on
-error spikes.
+triggers a Lambda that parses the records, runs anomaly detectors over them
+(ERRORs, 5xx spikes, error-rate and latency-p99 thresholds), emails **one
+consolidated alert** per file that trips a detector, and emits CloudWatch
+metrics with an alarm on error spikes. A CloudWatch dashboard visualizes the
+key metrics.
 
 Built with AWS SAM (Python 3.12). Everything is free-tier friendly.
 
@@ -18,21 +20,47 @@ Built with AWS SAM (Python 3.12). Everything is free-tier friendly.
    out of the pipeline).
 2. **Parse.** The Lambda streams the object and parses it as JSON-lines.
    Malformed lines are *counted* in the `MalformedLines` metric — never fatal.
-   A record is an error when `severity == "ERROR"` (case-insensitive).
-3. **Alert.** If a file contains errors, the function publishes **one** SNS
-   message listing up to 5 error summaries plus an overflow note
-   (`+N more error(s)`), so a bad deploy can't spam the inbox.
-4. **Observe.** Per-file metrics carry `Service` (most common service in the
-   file) and `LogFile` dimensions for dashboards; an additional
-   *undimensioned* `ErrorsSeen* datapoint is emitted per file so the alarm
-   can aggregate across files and services.
-5. **Retry semantics.** A total S3 read failure or SNS publish failure raises,
+3. **Detect.** Four detectors run over every file's records:
+   - `ERROR` records (`severity == "ERROR"`, case-insensitive) — the classic trigger;
+   - **5xx spike**: ≥ `FIVEXX_THRESHOLD` responses with `status_code` 500–599;
+   - **error rate**: `ERROR` records / total records ≥ `ERROR_RATE_THRESHOLD`;
+   - **latency p99**: p99 of `latency_ms` / `duration_ms` ≥ `LATENCY_P99_THRESHOLD_MS`.
+   Every detector that fires is named in the alert subject (`[5xx_spike]`)
+   and detailed in the email body.
+4. **Alert.** If a file contains errors or trips any detector, the function
+   publishes **one** SNS message listing up to 5 error summaries, the
+   detectors that fired, plus an overflow note (`+N more error(s)`), so a
+   bad deploy can't spam the inbox.
+5. **Observe.** Per-file metrics carry `Service` (most common service in the
+   file) and `LogFile` dimensions for dashboards; undimensioned
+   `ErrorsSeen` / `ServerErrors5xx` / `ErrorRate` / `LatencyP99` datapoints
+   are also emitted per file so the alarm and dashboard can aggregate across
+   files and services. A CloudWatch dashboard (errors, 5xx, error rate,
+   latency p99, Lambda invocations) is provisioned with the stack.
+6. **Retry semantics.** A total S3 read failure or SNS publish failure raises,
    so Lambda's async retry reprocesses the object. Metric emission is
    best-effort so a CloudWatch hiccup never blocks an alert.
 
 The IAM role is least-privilege: `s3:GetObject` on the logs bucket only,
 `sns:Publish` on the alert topic only, `cloudwatch:PutMetricData` scoped to
 the pipeline's namespace via condition, plus its own log group.
+
+## Configuration
+
+Detector thresholds are Lambda environment variables (set in
+`template.yaml`, no code change needed to tune):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ERROR_SUMMARY_LIMIT` | `5` | Max error summaries listed in the alert email |
+| `FIVEXX_THRESHOLD` | `5` | 5xx `status_code` responses per file that trip the 5xx-spike detector |
+| `ERROR_RATE_THRESHOLD` | `0.10` | `ERROR` fraction of records that trips the error-rate detector |
+| `LATENCY_P99_THRESHOLD_MS` | `2000` | p99 of `latency_ms`/`duration_ms` (ms) that trips the latency detector |
+| `METRIC_NAMESPACE` | `LogMonitoring` | CloudWatch namespace |
+| `EXPECTED_SUFFIX` | `.jsonl` | File suffix processed (matches the S3 trigger filter) |
+
+The CloudWatch `error-spike` alarm threshold is a separate SAM parameter,
+`ErrorThreshold` (default `5` errors in 5 minutes).
 
 ## Deploy
 
@@ -67,6 +95,26 @@ echo '{"ts":"2026-09-13T02:12:00Z","service":"payments","severity":"INFO","messa
   | aws s3 cp - "s3://$BUCKET/clean.jsonl"
 ```
 
+### Demo without real traffic
+
+`scripts/generate_sample_logs.py` (stdlib only, no AWS credentials needed)
+generates a realistic log file with a background error rate plus a
+concentrated **error burst** partway through — 5xx statuses, ERROR
+severities, spiking latency — so every detector fires on upload:
+
+```bash
+python3 scripts/generate_sample_logs.py --records 600 --burst-size 40
+aws s3 cp demo-logs.jsonl "s3://$BUCKET/demo-logs.jsonl"
+```
+
+Expect one alert email whose subject carries `[5xx_spike] [error_rate]
+[latency_p99]`, and watch the new metrics light up on the stack's
+CloudWatch dashboard (`<stack-name>-log-monitor` in the console).
+
+Useful flags: `--burst-at 0.6` (where in the file the burst lands),
+`--error-rate 0.03` (background errors outside the burst), `--seed 42`
+(reproducible output), `--output demo-logs.jsonl`.
+
 ## Testing matrix
 
 | Case | How to reproduce | Expected result |
@@ -77,6 +125,8 @@ echo '{"ts":"2026-09-13T02:12:00Z","service":"payments","severity":"INFO","messa
 | Large file | Upload a multi-MB `.jsonl` (within the 2 min timeout) | Processed line-by-line; alert lists first 5 errors + overflow note |
 | Permission error | Revoke the role's `s3:GetObject` (or delete the object mid-flight) | Handler raises → Lambda async retry; error visible in CloudWatch Logs |
 | Alarm firing | Upload files totaling ≥ `ErrorThreshold` errors in 5 min | `error-spike` alarm → `ALARM` → SNS email; returns to `OK` afterwards |
+| Detectors | Upload `demo-logs.jsonl` from the generator script | One email with `[5xx_spike] [error_rate] [latency_p99]` in the subject; `ServerErrors5xx`, `ErrorRate`, `LatencyP99` metrics emitted |
+| Dashboard | Deploy the stack, open CloudWatch → Dashboards | `<stack>-log-monitor` shows errors, 5xx, error rate, latency p99, invocations |
 | Duplicate event | Same object notification delivered twice | Idempotent-ish: second run re-emits metrics and re-sends the email (documented; add a DynamoDB dedupe table if this matters to you) |
 
 Run the unit suite (all AWS clients mocked, no credentials needed):
@@ -92,7 +142,7 @@ python3 -m pytest tests/ -q
 | Lambda | 1M requests + 400k GB-s / mo | A few invocations per log file |
 | S3 | 5 GB storage, 20k GETs, 2k PUTs / mo | One bucket, tiny log files |
 | SNS | 1,000 email publishes / mo | One email per error-containing file |
-| CloudWatch | 10 metrics, 10 alarms, 5 GB logs | 3 metrics, 1 alarm, small log volume |
+| CloudWatch | 10 metrics, 10 alarms, 5 GB logs | 6 metric names, 1 alarm, 1 dashboard, small log volume |
 
 Realistic monthly cost at hobby scale: **$0**.
 
@@ -100,7 +150,6 @@ Realistic monthly cost at hobby scale: **$0**.
 
 - Fan out alerts to Slack via AWS Chatbot in addition to email.
 - Add a DynamoDB dedupe table (object ETag) to make duplicate deliveries a no-op.
-- Ship a CloudWatch dashboard JSON for per-service error rates.
 - Compress/archive processed files to a second bucket with a lifecycle rule.
 - Split `LogProcessor` into parse + alert steps with SQS for backpressure on huge files.
 - Add per-service alarms (e.g. `payments` errors) using metric math.
@@ -112,5 +161,6 @@ Realistic monthly cost at hobby scale: **$0**.
 - [ ] Screenshot: the SNS "File Backed Up"-style alert email (subject `[LogMonitor] N error(s) in …`)
 - [ ] Screenshot: CloudWatch metrics graph (`ErrorsSeen`, `RecordsProcessed`)
 - [ ] Screenshot: `error-spike` alarm in `ALARM` state with notification history
+- [ ] Screenshot: CloudWatch dashboard with error / 5xx / latency widgets
 - [ ] GitHub repo: Lambda code + SAM template + this README
-- [ ] Resume bullet, e.g.: *"Built an event-driven log-monitoring pipeline on AWS (S3 → Lambda → SNS/CloudWatch) that parses JSON-lines logs, sends consolidated error alerts, and pages on error spikes — deployed with SAM, fully covered by mocked unit tests."*
+- [ ] Resume bullet, e.g.: *"Built an event-driven log-monitoring pipeline on AWS (S3 → Lambda → SNS/CloudWatch) that parses JSON-lines logs, runs anomaly detectors (5xx spikes, error-rate and latency-p99 thresholds) with consolidated alerting and a CloudWatch dashboard — deployed with SAM, fully covered by mocked unit tests."*

@@ -74,6 +74,10 @@ Resources:
           METRIC_NAMESPACE: !Ref MetricNamespace
           ERROR_SUMMARY_LIMIT: "5"
           EXPECTED_SUFFIX: !Ref LogSuffix
+          # Detector thresholds — tune these without redeploying code.
+          FIVEXX_THRESHOLD: "5"
+          ERROR_RATE_THRESHOLD: "0.10"
+          LATENCY_P99_THRESHOLD_MS: "2000"
       Events:
         LogUploaded:
           Type: S3
@@ -136,6 +140,63 @@ Resources:
         - !Ref AlertsTopic
       OKActions:
         - !Ref AlertsTopic
+
+  LogMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-log-monitor"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {
+                "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Errors seen (all files)",
+                  "metrics": [["${NS}", "ErrorsSeen", {"stat": "Sum"}]],
+                  "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+                }
+              },
+              {
+                "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "5xx responses (all files)",
+                  "metrics": [["${NS}", "ServerErrors5xx", {"stat": "Sum"}]],
+                  "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Error rate",
+                  "metrics": [["${NS}", "ErrorRate", {"stat": "Average"}]],
+                  "period": 300, "stat": "Average", "region": "${AWS::Region}"
+                }
+              },
+              {
+                "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Latency p99 (ms)",
+                  "metrics": [["${NS}", "LatencyP99", {"stat": "Maximum"}]],
+                  "period": 300, "stat": "Maximum", "region": "${AWS::Region}"
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 12, "width": 24, "height": 6,
+                "properties": {
+                  "title": "Lambda invocations vs errors",
+                  "metrics": [
+                    ["AWS/Lambda", "Invocations", "FunctionName",
+                     "${LogProcessor}", {"stat": "Sum"}],
+                    [".", "Errors", ".", ".", {"stat": "Sum"}]
+                  ],
+                  "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+                }
+              }
+            ]
+          }
+        - NS: !Ref MetricNamespace
+          LogProcessor: !Ref LogProcessor
 
 Outputs:
   LogsBucketName:
