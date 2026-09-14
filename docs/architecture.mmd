@@ -1,0 +1,8 @@
+flowchart LR
+    A["App writes logs<br/>service-2026-09-13.jsonl"] -->|aws s3 cp| B[("S3 Logs Bucket<br/>versioned · SSE-S3 · public-access blocked")]
+    B -->|"s3:ObjectCreated:* (suffix .jsonl)"| C["Lambda: LogProcessor<br/>parse → detect ERROR → alert → metrics"]
+    C -->|"one email per file"| D["SNS Topic: log-alerts"]
+    D -->|email| E["On-call inbox"]
+    C -->|"ErrorsSeen · RecordsProcessed · MalformedLines"| F[("CloudWatch Metrics<br/>namespace: LogMonitoring")]
+    F -->|"Sum(ErrorsSeen) ≥ 5 / 5 min"| G["CloudWatch Alarm: error-spike"]
+    G -->|alarm / OK| D
