@@ -157,13 +157,3 @@ Realistic monthly cost at hobby scale: **$0**.
 - Split `LogProcessor` into parse + alert steps with SQS for backpressure on huge files.
 - Add per-service alarms (e.g. `payments` errors) using metric math.
 
-## Portfolio deliverables checklist
-
-- [ ] Screenshot: objects in the logs bucket (versioning enabled)
-- [ ] Screenshot: Lambda execution in CloudWatch Logs (structured JSON lines)
-- [ ] Screenshot: the SNS "File Backed Up"-style alert email (subject `[LogMonitor] N error(s) in …`)
-- [ ] Screenshot: CloudWatch metrics graph (`ErrorsSeen`, `RecordsProcessed`)
-- [ ] Screenshot: `error-spike` alarm in `ALARM` state with notification history
-- [ ] Screenshot: CloudWatch dashboard with error / 5xx / latency widgets
-- [ ] GitHub repo: Lambda code + SAM template + this README
-- [ ] Resume bullet, e.g.: *"Built an event-driven log-monitoring pipeline on AWS (S3 → Lambda → SNS/CloudWatch) that parses JSON-lines logs, runs anomaly detectors (5xx spikes, error-rate and latency-p99 thresholds) with consolidated alerting and a CloudWatch dashboard — deployed with SAM, fully covered by mocked unit tests."*
