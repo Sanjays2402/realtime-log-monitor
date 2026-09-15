@@ -301,7 +301,8 @@ def _process_object(bucket, key):
         if not SNS_TOPIC_ARN:
             raise RuntimeError("SNS_TOPIC_ARN is not configured")
         shown = error_summaries[:ERROR_SUMMARY_LIMIT]
-        subject = f"[LogMonitor] {error_count} error(s) in {log_file}"
+        subject = (f"[LogMonitor] {error_count} error(s) "
+                   f"[{service}] in {log_file}")
         for finding in findings:
             subject += f" [{finding['detector']}]"
         message = _build_alert(bucket, key, error_count, error_summaries,

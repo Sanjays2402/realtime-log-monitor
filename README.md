@@ -30,7 +30,10 @@ Built with AWS SAM (Python 3.12). Everything is free-tier friendly.
 4. **Alert.** If a file contains errors or trips any detector, the function
    publishes **one** SNS message listing up to 5 error summaries, the
    detectors that fired, plus an overflow note (`+N more error(s)`), so a
-   bad deploy can't spam the inbox.
+   bad deploy can't spam the inbox. The email subject names the dominant
+   service in the file (`[LogMonitor] 2 error(s) [payments] in 2026-09-13.jsonl`),
+   followed by one `[detector]` tag per triggered detector, so the service
+   on fire is visible at a glance in the inbox.
 5. **Observe.** Per-file metrics carry `Service` (most common service in the
    file) and `LogFile` dimensions for dashboards; undimensioned
    `ErrorsSeen` / `ServerErrors5xx` / `ErrorRate` / `LatencyP99` datapoints

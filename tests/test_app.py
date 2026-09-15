@@ -127,6 +127,24 @@ def test_happy_path_errors_detected_sns_sent_once_metrics_emitted():
     assert processed[0]["Value"] == 4
 
 
+def test_alert_subject_names_dominant_service():
+    # Dominant service is 'search' (3 of 4 records) even though the
+    # single error came from 'payments' — the subject names the service
+    # whose logs the file mostly contains.
+    _s3_object([
+        _rec("INFO", "ok", service="search"),
+        _rec("ERROR", "card declined", service="payments"),
+        _rec("INFO", "ok", service="search"),
+        _rec("INFO", "ok", service="search"),
+    ])
+
+    app.lambda_handler(_event(), None)
+
+    _, kwargs = sns_mock.publish.call_args
+    assert "[search]" in kwargs["Subject"]
+    assert "1 error(s)" in kwargs["Subject"]
+
+
 def test_no_error_file_sends_no_sns_but_still_emits_metrics():
     _s3_object([_rec("INFO", "all good"), _rec("WARN", "slow query")])
 
