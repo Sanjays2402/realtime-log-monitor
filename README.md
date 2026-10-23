@@ -157,3 +157,15 @@ Realistic monthly cost at hobby scale: **$0**.
 - Split `LogProcessor` into parse + alert steps with SQS for backpressure on huge files.
 - Add per-service alarms (e.g. `payments` errors) using metric math.
 
+## Terms & Disclaimer
+
+By using this project you agree to the following.
+
+- **No warranty.** This software is provided "as is", without warranty of any kind, express or implied, including merchantability, fitness for a particular purpose, and non-infringement.
+- **No liability.** To the maximum extent permitted by law, the author and contributors are not liable for any claim, loss, or damage (direct, indirect, incidental, or consequential, including lost data or profits) arising from its use.
+- **Your responsibility.** You use it at your own risk and are responsible for complying with the laws that apply to you.
+- **Your data.** Keep backups; data loss is possible. If you process other people's personal information, you are responsible for complying with privacy laws such as US state privacy laws (e.g. CCPA), PIPEDA and Quebec's Law 25 (Canada), and the Digital Personal Data Protection Act, 2023 (India).
+- **Cloud costs and security.** If you deploy this, you are responsible for its security configuration and for any charges from your cloud provider.
+- **Third parties.** Names, logos, APIs, and services of others belong to their owners and are used for identification only; no affiliation or endorsement is implied.
+- **Your statutory rights.** Nothing here limits rights that cannot be waived by agreement, including under consumer-protection laws in the USA, Canada (including Quebec), and India (Consumer Protection Act, 2019).
+- **License.** No open-source license is granted. All rights reserved; you may view and fork this repository only as GitHub's Terms of Service allow.
